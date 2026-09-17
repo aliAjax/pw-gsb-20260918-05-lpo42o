@@ -120,6 +120,10 @@ function findRubbing(db, rubbingId) {
   return rubbing;
 }
 
+function isBlank(value) {
+  return value === undefined || value === null || String(value).trim() === "";
+}
+
 function enrichBatch(db, batch) {
   const damages = db.damages.filter((item) => batch.damageIds.includes(item.id));
   return {
@@ -233,6 +237,23 @@ async function handle(req, res) {
     if (!Array.isArray(body.damageIds) || body.damageIds.length === 0) return send(res, 400, { error: "damageIds必须是非空数组" });
     const invalid = body.damageIds.filter((id) => !db.damages.find((damage) => damage.id === id));
     if (invalid.length) return send(res, 400, { error: `缺损项不存在：${invalid.join(", ")}` });
+    const conflicts = [];
+    for (const id of body.damageIds) {
+      const damage = db.damages.find((item) => item.id === id);
+      if (damage.status === "repaired") {
+        conflicts.push(`${id}已修复`);
+        continue;
+      }
+      if (isBlank(damage.beforePhotoUrl)) {
+        conflicts.push(`${id}缺少修复前照片`);
+        continue;
+      }
+      if (damage.batchId) {
+        const owner = db.batches.find((batch) => batch.id === damage.batchId);
+        if (owner && owner.status !== "completed") conflicts.push(`${id}已属于未完成批次${damage.batchId}`);
+      }
+    }
+    if (conflicts.length) return send(res, 409, { error: `缺损项不可入批：${conflicts.join("；")}` });
     const batch = {
       id: makeId("batch"),
       name: body.name,
@@ -264,18 +285,31 @@ async function handle(req, res) {
   if (completeMatch && req.method === "POST") {
     const batch = db.batches.find((item) => item.id === completeMatch[1]);
     if (!batch) return send(res, 404, { error: "修补批次不存在" });
+    if (batch.status === "completed") return send(res, 409, { error: "批次已完成，不能重复完成" });
     const body = await parseBody(req);
     const results = Array.isArray(body.results) ? body.results : [];
+    const batchDamages = db.damages.filter((damage) => batch.damageIds.includes(damage.id));
+    const missing = [];
+    const plans = batchDamages.map((damage) => {
+      const result = results.find((item) => item.damageId === damage.id) || {};
+      const afterPhotoUrl = result.afterPhotoUrl || body.defaultAfterPhotoUrl || damage.afterPhotoUrl;
+      const repairNote = result.repairNote || body.defaultRepairNote || damage.repairNote;
+      const problems = [];
+      if (isBlank(afterPhotoUrl)) problems.push("修复后照片");
+      if (isBlank(repairNote)) problems.push("修复说明");
+      if (problems.length) missing.push(`${damage.id}缺少${problems.join("和")}`);
+      return { damage, afterPhotoUrl, repairNote };
+    });
+    if (missing.length) return send(res, 422, { error: `批次无法完成：${missing.join("；")}` });
     batch.status = "completed";
     batch.completedAt = new Date().toISOString();
     batch.note = body.note ?? batch.note;
-    db.damages.forEach((damage) => {
-      if (!batch.damageIds.includes(damage.id)) return;
-      const result = results.find((item) => item.damageId === damage.id) || {};
+    const repairedAt = new Date().toISOString();
+    plans.forEach(({ damage, afterPhotoUrl, repairNote }) => {
       damage.status = "repaired";
-      damage.afterPhotoUrl = result.afterPhotoUrl || body.defaultAfterPhotoUrl || damage.afterPhotoUrl;
-      damage.repairNote = result.repairNote || body.defaultRepairNote || damage.repairNote;
-      damage.repairedAt = new Date().toISOString();
+      damage.afterPhotoUrl = afterPhotoUrl;
+      damage.repairNote = repairNote;
+      damage.repairedAt = repairedAt;
     });
     await writeDb(db);
     return send(res, 200, { data: enrichBatch(db, batch) });
@@ -284,8 +318,16 @@ async function handle(req, res) {
   return send(res, 404, { error: "接口不存在", routes });
 }
 
+let requestQueue = Promise.resolve();
+
+function enqueue(task) {
+  const result = requestQueue.then(task);
+  requestQueue = result.catch(() => {});
+  return result;
+}
+
 const server = http.createServer((req, res) => {
-  handle(req, res).catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
+  enqueue(() => handle(req, res)).catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
 });
 
 server.listen(PORT, () => {
