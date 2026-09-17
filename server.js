@@ -79,6 +79,22 @@ async function writeDb(data) {
   await writeFile(DB_FILE, JSON.stringify(data, null, 2));
 }
 
+// 串行化批次创建/完成，避免并发请求把同一缺损放进两个批次
+let mutationQueue = Promise.resolve();
+function withMutationLock(fn) {
+  const run = mutationQueue.then(fn);
+  mutationQueue = run.catch(() => {});
+  return run;
+}
+
+function isBlank(value) {
+  return value === undefined || value === null || String(value).trim() === "";
+}
+
+function firstNonBlank(...values) {
+  return values.find((value) => !isBlank(value));
+}
+
 function send(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(body, null, 2));
@@ -231,26 +247,46 @@ async function handle(req, res) {
     const body = await parseBody(req);
     required(body, ["name", "damageIds"]);
     if (!Array.isArray(body.damageIds) || body.damageIds.length === 0) return send(res, 400, { error: "damageIds必须是非空数组" });
-    const invalid = body.damageIds.filter((id) => !db.damages.find((damage) => damage.id === id));
-    if (invalid.length) return send(res, 400, { error: `缺损项不存在：${invalid.join(", ")}` });
-    const batch = {
-      id: makeId("batch"),
-      name: body.name,
-      status: "open",
-      damageIds: body.damageIds,
-      note: body.note || "",
-      createdAt: new Date().toISOString(),
-      completedAt: null
-    };
-    db.batches.push(batch);
-    db.damages.forEach((damage) => {
-      if (body.damageIds.includes(damage.id)) {
-        damage.batchId = batch.id;
-        damage.status = "in_repair";
+    return withMutationLock(async () => {
+      const freshDb = await readDb();
+      const invalid = body.damageIds.filter((id) => !freshDb.damages.find((damage) => damage.id === id));
+      if (invalid.length) return send(res, 400, { error: `缺损项不存在：${invalid.join(", ")}` });
+      const openBatchIds = new Set(freshDb.batches.filter((batch) => batch.status !== "completed").map((batch) => batch.id));
+      const repaired = [];
+      const missingBeforePhoto = [];
+      const inOpenBatch = [];
+      body.damageIds.forEach((id) => {
+        const damage = freshDb.damages.find((item) => item.id === id);
+        if (damage.status === "repaired") repaired.push(id);
+        else if (isBlank(damage.beforePhotoUrl)) missingBeforePhoto.push(id);
+        else if (damage.batchId && openBatchIds.has(damage.batchId)) inOpenBatch.push(id);
+      });
+      if (repaired.length || missingBeforePhoto.length || inOpenBatch.length) {
+        const problems = [];
+        if (repaired.length) problems.push(`已修复：${repaired.join(", ")}`);
+        if (missingBeforePhoto.length) problems.push(`缺少修复前照片：${missingBeforePhoto.join(", ")}`);
+        if (inOpenBatch.length) problems.push(`已属于未完成批次：${inOpenBatch.join(", ")}`);
+        return send(res, 409, { error: `缺损项不可入批（${problems.join("；")}）` });
       }
+      const batch = {
+        id: makeId("batch"),
+        name: body.name,
+        status: "open",
+        damageIds: body.damageIds,
+        note: body.note || "",
+        createdAt: new Date().toISOString(),
+        completedAt: null
+      };
+      freshDb.batches.push(batch);
+      freshDb.damages.forEach((damage) => {
+        if (body.damageIds.includes(damage.id)) {
+          damage.batchId = batch.id;
+          damage.status = "in_repair";
+        }
+      });
+      await writeDb(freshDb);
+      return send(res, 201, { data: enrichBatch(freshDb, batch) });
     });
-    await writeDb(db);
-    return send(res, 201, { data: enrichBatch(db, batch) });
   }
 
   const batchMatch = pathname.match(/^\/batches\/([^/]+)$/);
@@ -262,23 +298,47 @@ async function handle(req, res) {
 
   const completeMatch = pathname.match(/^\/batches\/([^/]+)\/complete$/);
   if (completeMatch && req.method === "POST") {
-    const batch = db.batches.find((item) => item.id === completeMatch[1]);
-    if (!batch) return send(res, 404, { error: "修补批次不存在" });
     const body = await parseBody(req);
-    const results = Array.isArray(body.results) ? body.results : [];
-    batch.status = "completed";
-    batch.completedAt = new Date().toISOString();
-    batch.note = body.note ?? batch.note;
-    db.damages.forEach((damage) => {
-      if (!batch.damageIds.includes(damage.id)) return;
-      const result = results.find((item) => item.damageId === damage.id) || {};
-      damage.status = "repaired";
-      damage.afterPhotoUrl = result.afterPhotoUrl || body.defaultAfterPhotoUrl || damage.afterPhotoUrl;
-      damage.repairNote = result.repairNote || body.defaultRepairNote || damage.repairNote;
-      damage.repairedAt = new Date().toISOString();
+    return withMutationLock(async () => {
+      const freshDb = await readDb();
+      const batch = freshDb.batches.find((item) => item.id === completeMatch[1]);
+      if (!batch) return send(res, 404, { error: "修补批次不存在" });
+      const results = Array.isArray(body.results) ? body.results : [];
+      const updates = batch.damageIds
+        .map((damageId) => {
+          const damage = freshDb.damages.find((item) => item.id === damageId);
+          if (!damage) return null;
+          const result = results.find((item) => item && item.damageId === damageId) || {};
+          return {
+            damage,
+            afterPhotoUrl: firstNonBlank(result.afterPhotoUrl, body.defaultAfterPhotoUrl, damage.afterPhotoUrl),
+            repairNote: firstNonBlank(result.repairNote, body.defaultRepairNote, damage.repairNote)
+          };
+        })
+        .filter(Boolean);
+      const incomplete = updates.filter((item) => isBlank(item.afterPhotoUrl) || isBlank(item.repairNote));
+      if (incomplete.length) {
+        const details = incomplete.map((item) => {
+          const missing = [];
+          if (isBlank(item.afterPhotoUrl)) missing.push("修复后照片");
+          if (isBlank(item.repairNote)) missing.push("修复说明");
+          return `${item.damage.id}（缺${missing.join("、")}）`;
+        });
+        return send(res, 422, { error: `每个缺损都必须有非空修复后照片和修复说明，批次状态未变更：${details.join(", ")}` });
+      }
+      const now = new Date().toISOString();
+      batch.status = "completed";
+      batch.completedAt = now;
+      batch.note = body.note ?? batch.note;
+      updates.forEach(({ damage, afterPhotoUrl, repairNote }) => {
+        damage.status = "repaired";
+        damage.afterPhotoUrl = afterPhotoUrl;
+        damage.repairNote = repairNote;
+        damage.repairedAt = now;
+      });
+      await writeDb(freshDb);
+      return send(res, 200, { data: enrichBatch(freshDb, batch) });
     });
-    await writeDb(db);
-    return send(res, 200, { data: enrichBatch(db, batch) });
   }
 
   return send(res, 404, { error: "接口不存在", routes });
